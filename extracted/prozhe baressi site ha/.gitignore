@@ -1,0 +1,34 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Runtime data & state
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets & local overrides
+.env
+.env.*
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging & build artifacts
+*.zip
+*.tar.gz
+dist/
+build/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

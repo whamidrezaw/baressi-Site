@@ -1,0 +1,48 @@
+[Unit]
+Description=Website change monitor (embassy pages, news, RSS) with Telegram alerts
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=monitorsvc
+Group=monitorsvc
+WorkingDirectory=/opt/monitor
+ExecStart=/opt/monitor/venv/bin/python /opt/monitor/monitor_system.py run
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# Optional secrets file instead of putting the token in the config:
+#   TELEGRAM_BOT_TOKEN=123456:ABC...
+EnvironmentFile=-/opt/monitor/.env
+# Stop: SIGTERM goes to Python first (closes the browser cleanly), leftovers are killed after the timeout
+KillMode=mixed
+TimeoutStopSec=30
+
+# --- Resource limits (raise MemoryMax if `journalctl -k` shows OOM kills)
+MemoryMax=1536M
+CPUQuota=80%
+
+# --- Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# AF_NETLINK: Chromium watches network changes through netlink sockets
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Only the app folder is writable (database, logs, browser cache); /tmp is private
+ReadWritePaths=/opt/monitor
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
