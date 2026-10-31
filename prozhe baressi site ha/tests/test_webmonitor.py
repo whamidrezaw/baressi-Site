@@ -172,8 +172,10 @@ class ExtractTests(unittest.TestCase):
         self.assertIsNone(normalize_url("mailto:someone@example.com"))
 
     def test_items(self):
-        doc = parse_html(news_html([("/n/1", "First headline here"), ("/n/2", "Second headline here")])
-                         + "<ul class='news'><li><p>An item without any link at all</p></li></ul>", "https://n.example/list")
+        # the extra list must sit INSIDE the document: current parsers (lxml >= 6) drop whatever follows </html>
+        html = news_html([("/n/1", "First headline here"), ("/n/2", "Second headline here")]).replace(
+            "</body>", "<ul class='news'><li><p>An item without any link at all</p></li></ul></body>")
+        doc = parse_html(html, "https://n.example/list")
         items = extract_items(doc, "https://n.example/list", "ul.news > li")
         self.assertEqual([i.id for i in items[:2]], ["https://n.example/n/1", "https://n.example/n/2"])
         self.assertEqual(items[0].title, "First headline here")

@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 import time
 from collections import Counter
 from urllib.parse import parse_qsl, urlsplit
@@ -32,24 +33,33 @@ from .util import esc, fa_datetime, fa_digits, fa_number, format_short, human_du
 
 log = logging.getLogger("webmonitor")
 
-TOKEN_TTL = 86400 * 7  # 7 days for signed button URLs
+TOKEN_TTL = 86400  # a signed link stays valid for one day
 
 
-def make_admin_token(bot_token: str, user_id: str = "admin", ttl: int = TOKEN_TTL,
-                     now: float | None = None) -> str:
-    """Create an HMAC-SHA256 signed token ``<exp>.<uid>.<sig>`` bound to the bot token."""
-    if not bot_token:
+def miniapp_secret(store) -> str:
+    """Key that signs admin links: random, kept in the database and independent of the bot token, so a
+    leaked bot token alone cannot be used to forge a Mini App login."""
+    secret = store.get_setting("miniapp_secret", "")
+    if len(secret) < 32:
+        secret = secrets.token_hex(32)
+        store.set_setting("miniapp_secret", secret)
+    return secret
+
+
+def make_admin_token(secret: str, user_id: str, ttl: int = TOKEN_TTL, now: float | None = None) -> str:
+    """Create an HMAC-SHA256 signed token ``<exp>.<uid>.<sig>`` that is bound to one Telegram user id."""
+    uid = str(user_id or "").strip()
+    if not secret or not uid:
         return ""
     exp = int((now if now is not None else time.time()) + ttl)
-    uid = str(user_id or "admin").strip()
     payload = f"{exp}.{uid}"
-    sig = hmac.new(bot_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    sig = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
     return f"{payload}.{sig}"
 
 
-def verify_admin_token(token: str, bot_token: str, now: float | None = None) -> str | None:
+def verify_admin_token(token: str, secret: str, now: float | None = None) -> str | None:
     """Verify a token produced by ``make_admin_token``; returns ``user_id`` or ``None``."""
-    if not token or not bot_token:
+    if not token or not secret:
         return None
     parts = token.strip().split(".")
     if len(parts) != 3:
@@ -63,7 +73,7 @@ def verify_admin_token(token: str, bot_token: str, now: float | None = None) -> 
     if cur > exp:
         return None
     payload = f"{exp}.{uid}"
-    expected = hmac.new(bot_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    expected = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
     if not hmac.compare_digest(sig, expected):
         return None
     return uid
@@ -143,26 +153,22 @@ class MiniApp:
             return None
 
     def _is_authorized_user(self, uid: str) -> bool:
+        """Only people the bot knows as admins (configured, or seen using the panel) may use the Mini App."""
         uid = str(uid or "").strip()
         if not uid:
             return False
-        if uid == "admin":
-            return True
         cfg_admins = {str(x) for x in (self.m.config.telegram.admin_ids or [])}
         cfg_chats = {str(x) for x in (self.m.config.telegram.chat_ids or []) if not str(x).startswith("-")}
         db_admins = set(self.m.store.admin_ids())
-        known = cfg_admins | cfg_chats | db_admins
-        if not known:
-            # If no admin has interacted yet, allow and record on first valid initData
-            return True
-        return uid in known
+        return uid in (cfg_admins | cfg_chats | db_admins)
 
     def _authenticate(self, request: web.Request) -> tuple[bool, str]:
         bot_token = self.m.config.telegram.token
         if not bot_token:
             # Local dry-run / console mode without Telegram token
             return True, "local"
-        init_data = request.headers.get("X-Telegram-Init-Data", "") or request.query.get("initData", "")
+        # Credentials travel in headers only: a query string would end up in access logs.
+        init_data = request.headers.get("X-Telegram-Init-Data", "")
         if init_data:
             user = validate_init_data(init_data, bot_token)
             if user is not None:
@@ -173,9 +179,9 @@ class MiniApp:
                         self.m.store.touch_admin(uid, name)
                     return True, uid
                 return False, "این اکانت تلگرام دسترسی ادمین ندارد."
-        token = request.headers.get("X-Admin-Token", "") or request.query.get("t", "")
+        token = request.headers.get("X-Admin-Token", "")
         if token:
-            uid = verify_admin_token(token, bot_token)
+            uid = verify_admin_token(token, miniapp_secret(self.m.store))
             if uid and self._is_authorized_user(uid):
                 return True, uid
         return False, "نشست منقضی شده یا دسترسی غیرمجاز است. لطفاً دوباره از داخل ربات دکمهٔ «🚀 مینی‌اپ» را بزنید."
@@ -430,7 +436,7 @@ class MiniApp:
         except Exception:
             return web.json_response({"ok": False, "error": "دادهٔ نامعتبر"}, status=400)
         if "url" in data:
-            from .bot import is_public_host
+            from .netguard import is_public_host
             host = urlsplit(str(data["url"]).strip()).hostname or ""
             if not host or not await is_public_host(host):
                 return web.json_response(
@@ -565,7 +571,7 @@ class MiniApp:
             return web.json_response({"ok": False, "error": "لطفاً آدرس سایت را وارد کنید"}, status=400)
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        from .bot import is_public_host
+        from .netguard import is_public_host
         host = urlsplit(url).hostname or ""
         if not host or not await is_public_host(host):
             return web.json_response(
@@ -1064,7 +1070,13 @@ if (tg) {
 }
 
 const params = new URLSearchParams(window.location.search);
-const urlToken = params.get("t") || "";
+// the admin token (only used outside a Telegram Web App button) arrives in the URL fragment, which is never
+// sent to the server; it is read once and removed from the address bar
+const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+const urlToken = hashParams.get("t") || "";
+if (urlToken && window.history && history.replaceState) {
+  history.replaceState(null, "", window.location.pathname + window.location.search);
+}
 const initialSiteKey = params.get("site") ? parseInt(params.get("site"), 10) : null;
 
 let appState = null;

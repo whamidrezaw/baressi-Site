@@ -7,6 +7,7 @@ is still accepted so existing config files keep working.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -16,6 +17,13 @@ from urllib.parse import quote, unquote, urlsplit
 
 from cssselect import SelectorError
 from lxml.cssselect import CSSSelector
+
+try:  # regular expressions with a timeout (ReDoS guard); without the package the stdlib ``re`` is used
+    import regex as _regex
+except ImportError:  # pragma: no cover - depends on the installation
+    _regex = None
+
+log = logging.getLogger("webmonitor")
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -226,6 +234,9 @@ class Config:
     challenge_port: int = 8899
     challenge_ttl_seconds: int = 600
     challenge_ssh_command: str = ""  # shown to admins in the challenge message
+    miniapp_url: str = ""    # public base URL of the Mini App (the web server in front of it), or "off"
+    heartbeat_url: str = ""  # pinged regularly while alerts can still be delivered (dead-man's switch)
+    drift_detection: bool = True  # label (and shorten) alerts when a page was obviously rebuilt
     defaults: dict = field(default_factory=dict)      # normalised "defaults" block (applies to every watch)
     raw_watches: list = field(default_factory=list)   # watch entries exactly as written in the file
 
@@ -287,12 +298,73 @@ def check_selector(selector: str, where: str) -> None:
         raise ConfigError(f"{where}: invalid CSS selector {selector!r}: {exc}") from None
 
 
-def _compile_patterns(patterns: list[str], where: str) -> list[re.Pattern]:
+PATTERN_TIMEOUT = 0.5  # seconds one match may take before it is abandoned (protects the event loop)
+_PATTERN_ERRORS = (re.error,) + ((_regex.error,) if _regex is not None else ())
+
+
+class SafePattern:
+    """A user-written regular expression that cannot freeze the monitor.
+
+    Patterns come from admins (ignore_patterns, crawl include/exclude) and run on page text inside the event
+    loop; a careless pattern such as ``(a|aa)+$`` can take minutes on one long line. Matching therefore uses
+    the ``regex`` module with a timeout: a match that takes too long counts as "no match" (search) or "nothing
+    to remove" (sub) and is logged, instead of stalling every watch and the Telegram bot.
+    """
+
+    __slots__ = ("pattern", "_rx", "_slow")
+
+    def __init__(self, pattern: str):
+        self.pattern = pattern
+        engine = _regex or re
+        self._rx = engine.compile(pattern, engine.IGNORECASE)
+        self._slow = 0
+
+    def _timed_out(self) -> None:
+        self._slow += 1
+        if self._slow <= 3:
+            log.warning("regular expression %r took longer than %.1fs and was skipped for this text "
+                        "(nested quantifiers such as (a+)+ are the usual cause)", self.pattern, PATTERN_TIMEOUT)
+
+    def search(self, text: str):
+        try:
+            if _regex is None:
+                return self._rx.search(text)
+            return self._rx.search(text, timeout=PATTERN_TIMEOUT)
+        except TimeoutError:
+            self._timed_out()
+            return None
+
+    def sub(self, repl: str, text: str) -> str:
+        try:
+            if _regex is None:
+                return self._rx.sub(repl, text)
+            return self._rx.sub(repl, text, timeout=PATTERN_TIMEOUT)
+        except TimeoutError:
+            self._timed_out()
+            return text
+
+    def __eq__(self, other):
+        return isinstance(other, SafePattern) and other.pattern == self.pattern
+
+    def __hash__(self):
+        return hash(self.pattern)
+
+    def __repr__(self):
+        return f"SafePattern({self.pattern!r})"
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def _compile_patterns(patterns: list[str], where: str) -> list[SafePattern]:
     compiled = []
     for pattern in patterns:
         try:
-            compiled.append(re.compile(pattern, re.IGNORECASE))
-        except re.error as exc:
+            compiled.append(SafePattern(pattern))
+        except _PATTERN_ERRORS as exc:
             raise ConfigError(f"{where}: invalid regular expression {pattern!r}: {exc}") from None
     return compiled
 
@@ -374,7 +446,8 @@ _BROWSER_SPEC = {
 _TOP_KEYS = {
     "telegram", "timezone", "data_dir", "history_days", "daily_report_hour", "notify_startup",
     "max_concurrent_http", "impersonate", "user_agent", "accept_language", "global_proxy", "browser", "defaults",
-    "challenge_host", "challenge_port", "challenge_ttl_seconds", "challenge_ssh_command",
+    "challenge_host", "challenge_port", "challenge_ttl_seconds", "challenge_ssh_command", "miniapp_url",
+    "heartbeat_url", "drift_detection",
     "watches", "sites", "telegram_token", "telegram_chat_id", "max_concurrent_tasks",
 }
 
@@ -585,6 +658,14 @@ def parse_config(raw: Any, path: Path) -> Config:
     challenge_ttl = int(_coerce(raw.get("challenge_ttl_seconds", 600), int, "challenge_ttl_seconds"))
     _check_range(challenge_ttl, "challenge_ttl_seconds", 10, 86400)
 
+    miniapp_url = (os.environ.get("WEBMONITOR_MINIAPP_URL")
+                   or _coerce(raw.get("miniapp_url", ""), str, "miniapp_url")).strip().rstrip("/")
+    heartbeat_url = (os.environ.get("WEBMONITOR_HEARTBEAT_URL")
+                     or _coerce(raw.get("heartbeat_url", ""), str, "heartbeat_url")).strip()
+    for key, value in (("miniapp_url", miniapp_url), ("heartbeat_url", heartbeat_url)):
+        if value and value != "off" and urlsplit(value).scheme not in ("http", "https"):
+            raise ConfigError(f"{key}: must be a full http(s) URL such as https://example.org")
+
     return Config(
         path=path,
         data_dir=data_dir,
@@ -605,6 +686,9 @@ def parse_config(raw: Any, path: Path) -> Config:
         challenge_port=challenge_port,
         challenge_ttl_seconds=challenge_ttl,
         challenge_ssh_command=_coerce(raw.get("challenge_ssh_command", ""), str, "challenge_ssh_command"),
+        miniapp_url=miniapp_url,
+        heartbeat_url=heartbeat_url,
+        drift_detection=_coerce(raw.get("drift_detection", True), bool, "drift_detection"),
         defaults=defaults,
         raw_watches=[dict(item) for item in watch_list],
     )

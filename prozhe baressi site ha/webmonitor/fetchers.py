@@ -20,10 +20,15 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 
 from .extract import INTERSTITIALS, detect_block
+from .netguard import (
+    MAX_REDIRECTS, REDIRECT_STATUSES, STRICT, BlockedAddress, GuardedResolver, UnsafeTarget, ensure_public_url,
+    is_public_host, is_public_ip, redirect_url,
+)
 from .util import first_line
 
 log = logging.getLogger("webmonitor")
@@ -166,7 +171,8 @@ class HttpFetcher:
 
     def _new_session(self, connector=None) -> aiohttp.ClientSession:
         if connector is None:
-            connector = aiohttp.TCPConnector(limit=self.config.max_concurrent_http, limit_per_host=4, ttl_dns_cache=300)
+            connector = aiohttp.TCPConnector(limit=self.config.max_concurrent_http, limit_per_host=4, ttl_dns_cache=300,
+                                             resolver=GuardedResolver())
         return aiohttp.ClientSession(
             connector=connector,
             headers=browser_headers(self.user_agent, self.config.accept_language),
@@ -215,24 +221,46 @@ class HttpFetcher:
                 headers["If-None-Match"] = conditional["etag"]
             if conditional.get("last_modified"):
                 headers["If-Modified-Since"] = conditional["last_modified"]
-        timeout = aiohttp.ClientTimeout(total=watch.timeout_seconds, sock_connect=min(20.0, watch.timeout_seconds))
         started = time.monotonic()
+        # A site decides where its redirects lead, so they are followed by hand and every hop is checked
+        # (see netguard). Only watches that start on a public host are guarded: a target that is private on
+        # purpose (a LAN device, a local test server) stays reachable. Through an HTTP proxy the connection
+        # goes to the proxy, so the connect-time address check is skipped there.
+        strict = await is_public_host(urlsplit(url).hostname or "")
+        STRICT.set(strict and proxy is None)
+        current = url
         try:
-            async with session.request(method, url, headers=headers, proxy=proxy, ssl=bool(watch.verify_ssl),
-                                       allow_redirects=True, max_redirects=10, timeout=timeout) as resp:
-                status = resp.status
-                content_type = resp.headers.get("Content-Type", "")
-                etag = resp.headers.get("ETag")
-                last_modified = resp.headers.get("Last-Modified")
-                length = resp.headers.get("Content-Length")
-                length = int(length) if length and length.isdigit() else None
-                final_url = str(resp.url)
-                if status == 304:
-                    return FetchResult(url, final_url, 304, content_type, "", b"", self.engine, etag, last_modified,
-                                       length, not_modified=True, elapsed=time.monotonic() - started)
-                body = b"" if method == "HEAD" else await self._read(resp, max_bytes)
+            for _hop in range(MAX_REDIRECTS + 1):
+                remaining = watch.timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                timeout = aiohttp.ClientTimeout(total=remaining, sock_connect=min(20.0, remaining))
+                async with session.request(method, current, headers=headers, proxy=proxy, ssl=bool(watch.verify_ssl),
+                                           allow_redirects=False, timeout=timeout) as resp:
+                    location = resp.headers.get("Location")
+                    if resp.status in REDIRECT_STATUSES and location:
+                        current = redirect_url(str(resp.url), location)
+                        if strict:
+                            await ensure_public_url(current)
+                        continue
+                    status = resp.status
+                    content_type = resp.headers.get("Content-Type", "")
+                    etag = resp.headers.get("ETag")
+                    last_modified = resp.headers.get("Last-Modified")
+                    length = resp.headers.get("Content-Length")
+                    length = int(length) if length and length.isdigit() else None
+                    final_url = str(resp.url)
+                    if status == 304:
+                        return FetchResult(url, final_url, 304, content_type, "", b"", self.engine, etag, last_modified,
+                                           length, not_modified=True, elapsed=time.monotonic() - started)
+                    body = b"" if method == "HEAD" else await self._read(resp, max_bytes)
+                break
+            else:
+                raise FetchError("http", "too many redirects")
         except FetchError:
             raise
+        except UnsafeTarget as exc:
+            raise FetchError("unsafe", str(exc)) from None
         except asyncio.TimeoutError:
             raise FetchError("timeout", f"timed out after {watch.timeout_seconds:g}s") from None
         except aiohttp.ClientSSLError as exc:
@@ -241,6 +269,10 @@ class HttpFetcher:
             raise FetchError("http", "too many redirects") from None
         except aiohttp.ClientResponseError as exc:
             raise FetchError("http", f"HTTP {exc.status} {exc.message}", exc.status) from None
+        except aiohttp.ClientConnectorError as exc:
+            if isinstance(getattr(exc, "os_error", None), BlockedAddress):
+                raise FetchError("unsafe", str(exc.os_error)) from None
+            raise FetchError("network", f"{type(exc).__name__}: {first_line(exc)}") from None
         except aiohttp.ClientError as exc:
             raise FetchError("network", f"{type(exc).__name__}: {first_line(exc)}") from None
         except ValueError as exc:
@@ -380,9 +412,32 @@ class ImpersonateFetcher:
             if conditional.get("last_modified"):
                 headers["If-Modified-Since"] = conditional["last_modified"]
         started = time.monotonic()
+        strict = await is_public_host(urlsplit(url).hostname or "")  # see HttpFetcher.fetch / netguard
+        current = url
         try:
-            resp = await session.request(method, url, headers=headers, timeout=watch.timeout_seconds,
-                                         allow_redirects=True, max_redirects=10, verify=bool(watch.verify_ssl))
+            for _hop in range(MAX_REDIRECTS + 1):
+                remaining = watch.timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise FetchError("timeout", f"timed out after {watch.timeout_seconds:g}s")
+                resp = await session.request(method, current, headers=headers, timeout=remaining,
+                                             allow_redirects=False, verify=bool(watch.verify_ssl))
+                if strict and proxy is None:
+                    peer = getattr(resp, "primary_ip", "") or ""
+                    if peer and not is_public_ip(peer):
+                        raise FetchError("unsafe", f"the connection ended on a non-public address ({peer})")
+                location = resp.headers.get("location")
+                if resp.status_code in REDIRECT_STATUSES and location:
+                    current = redirect_url(str(resp.url), location)
+                    if strict:
+                        await ensure_public_url(current)
+                    continue
+                break
+            else:
+                raise FetchError("http", "too many redirects")
+        except FetchError:
+            raise
+        except UnsafeTarget as exc:
+            raise FetchError("unsafe", str(exc)) from None
         except Exception as exc:  # curl_cffi.requests.errors.RequestsError and friends
             raise _curl_error(exc, watch.timeout_seconds) from None
         status = resp.status_code

@@ -14,15 +14,18 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+import aiohttp
+
 from . import report
 from .config import ConfigError, Proxy, Watch
 from .extract import (
     ASSET_EXTENSIONS, FILE_EXTENSIONS, ExtractError, Snapshot, detect_block, document_base, extract_headlines,
     extract_items, extract_links, json_snapshot, looks_like_feed, normalize_url, page_snapshot, parse_feed,
-    parse_html, parse_json_body, same_site, url_extension, visible_text_length,
+    parse_html, parse_json_body, same_site, suggest_selector, url_extension, visible_text_length,
 )
 from .challenge import ChallengeManager
 from .fetchers import MAX_FILE_BYTES, BrowserFetcher, FetchError, HttpFetcher, ImpersonateFetcher, port_open
+from .health import build_health
 from .notifier import (
     ConsoleNotifier, NotifyError, TelegramApiError, TelegramNotifier, build_parts, explain_telegram_error,
 )
@@ -49,6 +52,48 @@ ENGINE_LABELS = {"http": "سریع (HTTP)", "impersonate": "شبیه‌ساز ک
 ALARM_ROUNDS = 6        # wake-up mode: urgent private alerts repeated until acknowledged
 ALARM_INTERVAL = 45     # seconds between repeats
 BACKOFF_CAP = 1800      # longest wait between checks of a failing site
+HEARTBEAT_EVERY = 300           # seconds between pings of the external heartbeat URL
+HEARTBEAT_OUTBOX_STALE = 1800   # no ping while a due notification has been waiting this long (alerts are stuck)
+BACKUP_EVERY = 86400            # one database copy per day ...
+BACKUP_KEEP = 7                 # ... and the newest seven are kept
+CRASH_ALERT_EVERY = 1800        # at most one "a part crashed" message per task and half hour
+
+
+async def supervise(name: str, factory, *, on_crash=None, stop: asyncio.Event | None = None,
+                    min_delay: float = 2.0, max_delay: float = 120.0, stable_after: float = 60.0,
+                    stats: dict | None = None) -> None:
+    """Run ``factory()`` (a coroutine function) and run it again when it fails or returns early.
+
+    The background loops (delivery, reports, the Telegram bot, one loop per site) are what keeps a monitor
+    useful: if one dies silently, alerts or checks simply stop. Cancellation passes through untouched, so a
+    normal shutdown still works. A task that keeps crashing is restarted with a growing delay."""
+    delay = 0.0
+    while True:
+        started = time.monotonic()
+        try:
+            await factory()
+            reason = "ended unexpectedly"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("[supervisor] %s crashed", name)
+            reason = f"{type(exc).__name__}: {exc}"
+        if stop is not None and stop.is_set():
+            return
+        ran = time.monotonic() - started
+        delay = min_delay if (delay == 0.0 or ran >= stable_after) else min(delay * 2, max_delay)
+        if stats is not None:  # read by the health report
+            stats["restarts"] = stats.get("restarts", 0) + 1
+            stats["last_crash"] = time.time()
+            stats["last_reason"] = reason[:200]
+        log.warning("[supervisor] %s %s - restarting in %.0fs", name, reason, delay,
+                    extra={"task": name, "restart_in_s": delay})
+        if on_crash is not None:
+            try:
+                on_crash(name, reason, delay)
+            except Exception:
+                log.debug("crash callback failed", exc_info=True)
+        await asyncio.sleep(delay)
 WARP_PROXY = "socks5://127.0.0.1:40000"   # Cloudflare WARP in proxy mode (see README)
 NOISY_CHANGES = 6       # page changes within an hour that suggest the "new headlines" mode
 
@@ -82,6 +127,16 @@ def _is_blocked(exc: Exception) -> bool:
     if isinstance(exc, FetchError):
         return exc.kind in ("blocked", "rate_limit") or exc.status in SWITCH_STATUSES
     return isinstance(exc, ExtractError) and exc.kind == "blocked"
+
+
+def _outcome_kind(result: str) -> str:
+    """A short, stable word for the text a check returns (a field of the JSON log)."""
+    text = result.lower()
+    for prefix, kind in (("baseline", "baseline"), ("no change", "unchanged"), ("no new", "unchanged"),
+                         ("content only", "reordered"), ("change", "changed"), ("error", "error")):
+        if text.startswith(prefix):
+            return kind
+    return "other"
 
 
 def _is_rate_limit(exc: Exception) -> bool:
@@ -143,6 +198,11 @@ class Monitor:
         self._alarms: dict[int, asyncio.Task] = {}
         self._alarm_by_watch: dict[str, int] = {}
         self._alarm_seq = 0
+        self._crash_alerts: dict[str, float] = {}
+        self._task_stats: dict[str, dict] = {}       # restarts per supervised task (see supervise)
+        self._core_tasks: dict[str, asyncio.Task] = {}  # dispatch, housekeeping, heartbeat, bot
+        self._drift: dict[str, dict] = {}            # last large-scale page change per site (for /health)
+        self.db_integrity = "unchecked"
         self._warp: tuple[float, bool] | None = None  # (checked at, running) for the WARP proxy
         self.challenge = ChallengeManager(
             host=config.challenge_host,
@@ -152,6 +212,7 @@ class Monitor:
         from .miniapp import MiniApp
         self.miniapp = MiniApp(self)
         self.challenge.add_routes(self.miniapp.register_routes)
+        self.challenge.health_provider = lambda: build_health(self)
         self._challenge_ready = False
 
     @property
@@ -184,6 +245,13 @@ class Monitor:
                      info["challenge"], info["notifier"])
         except Exception:
             log.debug("self-check failed", exc_info=True)
+        verdict = self.store.quick_check()
+        self.db_integrity = verdict
+        if verdict != "ok":
+            log.error("Database integrity check failed: %s", verdict)
+            self._enqueue_info("🚨 <b>بررسی سلامت دیتابیس خطا داد</b>",
+                               [f"<code>{esc(truncate(verdict, 300))}</code>",
+                                "آخرین نسخهٔ پشتیبان در پوشهٔ <code>data/backups</code> است."])
         if self._fixed_watches is not None:
             watches = list(self._fixed_watches)
         else:
@@ -223,13 +291,14 @@ class Monitor:
             self._enqueue_info(*self._startup_report())
         for w in self.watches:
             self._start_watch_tasks(w)
-        tasks = [asyncio.create_task(self._dispatch_loop(), name="dispatch"),
-                 asyncio.create_task(self._housekeeping_loop(), name="housekeeping")]
+        tasks = [self._spawn("dispatch", self._dispatch_loop), self._spawn("housekeeping", self._housekeeping_loop)]
+        if self.config.heartbeat_url:
+            tasks.append(self._spawn("heartbeat", self._heartbeat_loop))
         if isinstance(self.notifier, TelegramNotifier) and self.config.telegram.commands:
             from .bot import AdminBot
 
             self.bot = AdminBot(self)
-            tasks.append(asyncio.create_task(self.bot.run(), name="bot"))
+            tasks.append(self._spawn("bot", self.bot.run))
         log.info("Monitoring %d watch(es); notifications via %s", len(self.watches), self.notifier.name)
         try:
             await self._stop.wait()
@@ -246,15 +315,42 @@ class Monitor:
             except Exception:
                 pass
 
+    def _spawn(self, name: str, factory) -> asyncio.Task:
+        """A background task that is restarted (and reported) instead of dying silently."""
+        task = asyncio.create_task(supervise(name, factory, on_crash=self._on_task_crash, stop=self._stop,
+                                             stats=self._task_stats.setdefault(name, {})), name=name)
+        if not name.startswith(("watch:", "crawl:")):
+            self._core_tasks[name] = task
+        return task
+
+    def _on_task_crash(self, name: str, reason: str, restart_in: float) -> None:
+        """Tell the admins that a part of the monitor crashed (at most once per task and half hour)."""
+        now = time.time()
+        if now - self._crash_alerts.get(name, 0.0) < CRASH_ALERT_EVERY:
+            return
+        self._crash_alerts[name] = now
+        self._enqueue_info(f"⚠️ <b>بخش «{esc(name)}» با خطا متوقف شد</b> و {fa_digits(int(restart_in))} ثانیهٔ دیگر "
+                           f"خودکار دوباره اجرا می‌شود.", [f"<code>{esc(truncate(reason, 300))}</code>"])
+
+    def _note_drift(self, w, url: str, drift) -> None:
+        """Remember (for /health) and log that a page changed on a large scale."""
+        self._drift[w.id] = {"level": drift.level, "ts": time.time(), "url": url, **drift.as_dict()}
+        log.warning("[%s] layout change (%s): %.0f%% of the lines replaced, %.0f%% shared vocabulary, "
+                    "%.0f%% of the headings kept",
+                    w.id, drift.level, drift.churn * 100, drift.vocab * 100, drift.headings * 100,
+                    extra={"watch": w.id, "drift": drift.level, "churn": round(drift.churn, 2),
+                           "vocab": round(drift.vocab, 2), "headings": round(drift.headings, 2),
+                           "size": round(drift.size, 2)})
+
     # ------------------------------------------------------------------ runtime watch management
 
     def _start_watch_tasks(self, w) -> None:
         self._triggers[w.id] = asyncio.Event()
-        tasks = [asyncio.create_task(self._watch_loop(w), name=f"watch:{w.id}")]
+        tasks = [self._spawn(f"watch:{w.id}", lambda: self._watch_loop(w))]
         if w.crawl:
             self._crawl_wake.setdefault(w.id, asyncio.Event())
             self._crawl_pending.setdefault(w.id, set())
-            tasks.append(asyncio.create_task(self._crawl_loop(w), name=f"crawl:{w.id}"))
+            tasks.append(self._spawn(f"crawl:{w.id}", lambda: self._crawl_loop(w)))
         self._tasks[w.id] = tasks
 
     async def _stop_watch_tasks(self, watch_id: str) -> None:
@@ -345,7 +441,10 @@ class Monitor:
             self._on_success(w)
             if result.startswith("baseline"):
                 self._after_baseline(w)
-            log.info("[%s] %s (%.1fs)", w.id, result, time.monotonic() - started)
+            elapsed = time.monotonic() - started
+            log.info("[%s] %s (%.1fs)", w.id, result, elapsed,
+                     extra={"watch": w.id, "outcome": _outcome_kind(result), "duration_ms": int(elapsed * 1000),
+                            "engine": self.engine_for(w)})
             return result
 
     # ------------------------------------------------------------------ rate-limit timing + exit-IP (Sprint 3.4.4)
@@ -461,7 +560,9 @@ class Monitor:
         state = self.store.record_check_error(w.id, message)
         count = state.get("consecutive_errors", 1)
         self._stats[w.id]["errors"] += 1
-        log.warning("[%s] check failed (%d in a row): %s", w.id, count, message)
+        log.warning("[%s] check failed (%d in a row): %s", w.id, count, message,
+                    extra={"watch": w.id, "outcome": "error", "consecutive": count,
+                           "error_kind": getattr(exc, "kind", type(exc).__name__)})
         if count >= w.error_threshold and not state.get("alerted"):
             payload, summary = report.error_event(w, message, count, self._error_hint(exc), time.time(), self.tz,
                                                   key=self._key(w))
@@ -490,8 +591,12 @@ class Monitor:
             return ("سایت IP این سرور را مسدود کرده است (معمولاً موقت). اگر پروکسی WARP روی سرور فعال باشد، "
                     "سیستم خودکار از آن استفاده می‌کند؛ «🧪 تست دسترسی» نشان می‌دهد کدام روش و مسیر جواب می‌دهد.")
         if isinstance(exc, ExtractError) and exc.kind in ("selector", "short"):
-            return ("احتمالاً ساختار صفحه عوض شده است؛ در کارت سایت «✏️ ویرایش ← 🎯 حالت پایش» را بزنید تا صفحه "
+            hint = ("احتمالاً ساختار صفحه عوض شده است؛ در کارت سایت «✏️ ویرایش ← 🎯 حالت پایش» را بزنید تا صفحه "
                     "دوباره بررسی و بخش درست انتخاب شود.")
+            if getattr(exc, "suggestion", ""):
+                hint += (f"\n💡 نزدیک‌ترین بخش به محتوای قبلی: <code>{esc(exc.suggestion)}</code> "
+                         f"({fa_digits(round(exc.cover * 100))}٪ هم‌پوشانی)؛ همان را به‌عنوان انتخابگر بگذارید.")
+            return hint
         if isinstance(exc, FetchError):
             if exc.kind == "timeout":
                 return "سایت کند یا از دسترس خارج است؛ اگر ادامه داشت، فاصلهٔ بررسی را بیشتر کنید."
@@ -574,7 +679,8 @@ class Monitor:
                                            wait_for=wait_for)
                 if result.not_modified:
                     return result, None
-                parsed = parse(result)
+                # parsing and text extraction are CPU-bound (seconds for a multi-MB page): keep the loop free
+                parsed = await asyncio.to_thread(parse, result)
             except (FetchError, ExtractError) as exc:
                 if index + 1 < len(chain) and _worth_switching(exc, candidate):
                     log.info("[%s] %s engine was not enough (%s); trying %s", w.id, candidate, exc, chain[index + 1])
@@ -822,7 +928,7 @@ class Monitor:
     def _root(self, w) -> str:
         return normalize_url(w.url) or w.url
 
-    def _parse_page(self, w, result, *, subpage: bool = False):
+    def _parse_page(self, w, result, *, subpage: bool = False, prev_json: str | None = None):
         if not result.text:
             raise ExtractError(f"not an HTML page (Content-Type: {result.content_type or 'unknown'})", kind="type")
         doc = parse_html(result.text, result.final_url)
@@ -836,6 +942,18 @@ class Monitor:
             hint = detect_block(result.text)
             if hint:
                 raise ExtractError(f"{exc} — the page looks like {hint}", kind="blocked") from None
+            if exc.kind == "selector" and prev_json:
+                # the selector stopped matching: look for the element that holds the text it used to select
+                try:
+                    found = suggest_selector(doc, base, Snapshot.from_json(prev_json).lines,
+                                             exclude_selectors=w.exclude_selectors, ignore_patterns=w.ignore_patterns,
+                                             track_links=w.track_links)
+                except Exception:
+                    found = None
+                if found:
+                    exc.suggestion, exc.cover = found
+                    exc.args = (f"{exc.args[0]} — closest match for the previous content: {found[0]} "
+                                f"({round(found[1] * 100)}% of it)",)
             raise
         minimum = 1 if subpage else w.min_content_length
         if snap.text_length < minimum:
@@ -856,8 +974,8 @@ class Monitor:
                                kind="blocked" if hint else "type") from None
         return json_snapshot(data, w.json_records, w.json_template, w.json_labels, w.json_filter), []
 
-    def _parse_content(self, w, result):
-        return self._parse_json(w, result) if w.type == "json" else self._parse_page(w, result)
+    def _parse_content(self, w, result, prev_json: str | None = None):
+        return self._parse_json(w, result) if w.type == "json" else self._parse_page(w, result, prev_json=prev_json)
 
     async def _check_page(self, w) -> str:
         root = self._root(w)
@@ -866,7 +984,7 @@ class Monitor:
         if prev is not None and prev["snapshot"] and prev["fingerprint"] == watch_fingerprint(w) and not w.cache_bust:
             conditional = {"etag": prev["etag"], "last_modified": prev["last_modified"]}
         url = _cache_busted(w.url) if w.cache_bust else w.url
-        result, parsed = await self._fetch_parse(w, url, lambda r: self._parse_content(w, r),
+        result, parsed = await self._fetch_parse(w, url, lambda r: self._parse_content(w, r, prev["snapshot"] if prev else None),
                                                  conditional=conditional, wait_for=w.wait_selector)
         if result.not_modified:
             self.store.touch_page(w.id, root)
@@ -908,11 +1026,19 @@ class Monitor:
         eff_style = getattr(w, "report_style", "inline")
         if eff_style == "inline" and self.store.get_setting("default_report_style", "inline") == "before_after":
             eff_style = "before_after"
+        drift = None
+        if getattr(self.config, "drift_detection", True):
+            drift = report.assess_drift(old.lines, snap.lines, old.headings, snap.headings,
+                                        old.text_length, snap.text_length)
         payload, summary, hits = report.change_event(
             w, url, hunks, added, removed, time.time(), self.tz, snap.title,
             total_chars=snap.text_length,
             style=eff_style,
+            drift=drift,
         )
+        if drift is not None and drift.level != "normal":
+            payload["drift"] = drift.as_dict()
+            self._note_drift(w, url, drift)
         status = "filtered" if w.only_keywords and not hits else "pending"
         # Sprint 2.1: capture a screenshot if this watch or global auto_screenshot asks for one.
         deliver_mode = "text"
@@ -1200,7 +1326,7 @@ class Monitor:
                 self._apply_file(w, url, prev, result, baseline, stats)
                 return []
             try:
-                snap, links = self._parse_page(w, result, subpage=True)
+                snap, links = await asyncio.to_thread(self._parse_page, w, result, subpage=True)
             except ExtractError as exc:
                 log.debug("[%s] skipped %s: %s", w.id, url, exc)
                 return []
@@ -1791,13 +1917,14 @@ class Monitor:
                 except Exception:
                     log.exception("pruning screenshots failed")
                 last_prune = now
+            await self._maybe_backup(now)
             if next_report and now >= next_report:
-                if self.store.get_setting("daily_report", "on") == "on":
-                    self._enqueue_info(*self.status_report(daily=True))
-                    try:
+                try:
+                    if self.store.get_setting("daily_report", "on") == "on":
+                        self._enqueue_info(*self.status_report(daily=True))
                         await self._enqueue_daily_screenshots()
-                    except Exception:
-                        log.exception("daily screenshots failed")
+                except Exception:
+                    log.exception("daily report failed")
                 next_report = self._next_report_time()
             await asyncio.sleep(30)
 
@@ -1810,6 +1937,51 @@ class Monitor:
         if target <= now:
             target += timedelta(days=1)
         return target.timestamp()
+
+    async def _maybe_backup(self, now: float) -> None:
+        """One copy of monitor.db per day: sites added from the Telegram panel exist only in that file."""
+        try:
+            last = float(self.store.get_setting("last_backup", "0") or 0)
+        except ValueError:
+            last = 0.0
+        if now - last < BACKUP_EVERY:
+            return
+        self.store.set_setting("last_backup", str(now))  # a failing backup is retried tomorrow, not every 30 s
+        try:
+            target = await asyncio.to_thread(self.store.backup, self.config.data_dir / "backups", BACKUP_KEEP)
+            problem = "" if target is not None else "the copy failed its integrity check"
+        except Exception as exc:
+            log.exception("database backup failed")
+            target, problem = None, f"{type(exc).__name__}: {exc}"
+        if target is not None:
+            log.info("Database backup written: %s", target.name)
+        else:
+            self._enqueue_info("⚠️ <b>پشتیبان‌گیری از دیتابیس ناموفق بود</b>", [f"<code>{esc(truncate(problem, 300))}</code>"])
+
+    async def _heartbeat_once(self) -> bool:
+        """Ping the heartbeat URL, but only while alerts can still get out; True when a ping was sent."""
+        stale = self.store.overdue_outbox_age()
+        if stale >= HEARTBEAT_OUTBOX_STALE:
+            log.warning("Heartbeat withheld: a notification has been waiting for %d min", int(stale // 60))
+            return False
+        return await self._ping(self.config.heartbeat_url)
+
+    async def _heartbeat_loop(self) -> None:
+        """Dead-man's switch: an outside service (healthchecks.io, Uptime Kuma, ...) raises the alarm when
+        these pings stop - server down, process stuck, or notifications piling up undelivered."""
+        while True:
+            await self._heartbeat_once()
+            await asyncio.sleep(HEARTBEAT_EVERY)
+
+    @staticmethod
+    async def _ping(url: str) -> bool:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(url) as resp:
+                    return resp.status < 400
+        except Exception as exc:  # never log the URL: it usually contains a secret
+            log.warning("Heartbeat ping failed (%s)", type(exc).__name__)
+            return False
 
     # ------------------------------------------------------------------ one-shot (CLI)
 

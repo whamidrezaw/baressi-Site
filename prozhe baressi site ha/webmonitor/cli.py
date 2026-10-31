@@ -16,6 +16,8 @@ from pathlib import Path
 from . import __version__
 from .config import ConfigError, load_config, parse_config
 from .engine import Monitor
+from .health import format_health
+from .logfmt import JsonFormatter, add_json_file
 from .notifier import NotifyError, TelegramNotifier, build_parts, explain_telegram_error, html_to_text
 from .registry import WatchRegistry
 from .storage import Store
@@ -39,8 +41,11 @@ def setup_logging(data_dir: Path, verbose: bool, to_file: bool) -> None:
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
     under_systemd = bool(os.environ.get("JOURNAL_STREAM") or os.environ.get("INVOCATION_ID"))
     console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(logging.Formatter(
-        "[%(levelname)s] %(message)s" if under_systemd else "%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+    if os.environ.get("WEBMONITOR_LOG_FORMAT", "").strip().lower() == "json":
+        console.setFormatter(JsonFormatter())  # one JSON object per line, e.g. for journald or a log shipper
+    else:
+        console.setFormatter(logging.Formatter(
+            "[%(levelname)s] %(message)s" if under_systemd else "%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
     root.addHandler(console)
     if to_file and not under_systemd:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -48,6 +53,8 @@ def setup_logging(data_dir: Path, verbose: bool, to_file: bool) -> None:
                                       encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         root.addHandler(handler)
+    if to_file:
+        add_json_file(root, data_dir, logging.DEBUG if verbose else logging.INFO)  # data/monitor.jsonl (jq & co.)
     for noisy in ("asyncio", "aiohttp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -341,6 +348,24 @@ async def cmd_validate(config, args) -> int:
     return 0
 
 
+async def cmd_health(config, args) -> int:
+    """Ask the RUNNING monitor how it is doing. Exit code: 0 ok, 1 degraded, 2 down or not running."""
+    import aiohttp
+
+    host = "127.0.0.1" if config.challenge_host in ("", "0.0.0.0", "::") else config.challenge_host
+    url = f"http://{host}:{config.challenge_port}/health"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(url) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as exc:
+        print(f"DOWN   the monitor does not answer on {url} ({type(exc).__name__}) - is it running?")
+        return 2
+    print(json.dumps(data, ensure_ascii=False, indent=2) if args.json else format_health(data))
+    status = data.get("status") or ("ok" if data.get("ok") else "down")
+    return {"ok": 0, "degraded": 1}.get(status, 2)
+
+
 # --------------------------------------------------------------------------- entry point
 
 def build_parser() -> argparse.ArgumentParser:
@@ -366,6 +391,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("watch")
     p.add_argument("--limit", type=int, default=60)
     sub.add_parser("validate", help="check the config file")
+    p = sub.add_parser("health", help="ask the running monitor how it is doing (exit code 0 ok, 1 degraded, 2 down)")
+    p.add_argument("--json", action="store_true", help="print the raw JSON report")
     sub.add_parser("test-telegram", help="send a test message to every chat id")
     sub.add_parser("chat-id", help="find your Telegram chat id (message your bot first)")
     p = sub.add_parser("history", help="list recent detected changes / alerts")
@@ -381,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {
     "run": cmd_run, "once": cmd_once, "inspect": cmd_inspect, "diagnose": cmd_diagnose, "preview": cmd_preview,
-    "validate": cmd_validate,
+    "validate": cmd_validate, "health": cmd_health,
     "test-telegram": cmd_test_telegram, "chat-id": cmd_chat_id, "history": cmd_history, "reset": cmd_reset,
     "package": cmd_package,
 }

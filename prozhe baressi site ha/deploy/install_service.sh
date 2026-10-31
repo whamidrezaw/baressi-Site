@@ -66,14 +66,16 @@ cd "$APP_DIR"
 echo "==> [5/9] محیط مجازی پایتون و کتابخانه‌ها"
 [[ -x "$PY" ]] || python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install -q --upgrade pip
-# -U keeps curl_cffi's browser fingerprints current (bot walls reject outdated ones)
-if ! "$APP_DIR/venv/bin/pip" install -q -U -r "$APP_DIR/requirements.txt"; then
+# requirements.txt pins the tested versions; only curl_cffi is moved forward afterwards, because bot walls
+# reject outdated browser fingerprints
+if ! "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"; then
   echo "    !! نصب یکی از کتابخانه‌ها ناموفق بود؛ بقیه نصب می‌شوند (شبیه‌ساز کروم یا پروکسی SOCKS ممکن است در دسترس نباشد)."
-  grep -v -e '^curl_cffi' -e '^aiohttp-socks' "$APP_DIR/requirements.txt" | "$APP_DIR/venv/bin/pip" install -q -U -r /dev/stdin
+  grep -v -e '^curl_cffi' -e '^aiohttp-socks' "$APP_DIR/requirements.txt" | "$APP_DIR/venv/bin/pip" install -q -r /dev/stdin
   for optional in curl_cffi aiohttp-socks; do
-    "$APP_DIR/venv/bin/pip" install -q -U "$optional" || echo "    !! $optional نصب نشد."
+    "$APP_DIR/venv/bin/pip" install -q "$optional" || echo "    !! $optional نصب نشد."
   done
 fi
+"$APP_DIR/venv/bin/pip" install -q -U curl_cffi || true
 
 echo "==> [6/9] کتابخانه‌های سیستمی لازم برای مرورگر"
 "$APP_DIR/venv/bin/patchright" install-deps chromium \

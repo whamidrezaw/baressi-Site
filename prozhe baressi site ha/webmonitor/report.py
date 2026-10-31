@@ -19,6 +19,7 @@ group inside a quote block — long groups are collapsible.
 from __future__ import annotations
 
 import difflib
+import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import tzinfo
@@ -483,9 +484,83 @@ def _published(value: str, tz: tzinfo) -> str:
 
 # --------------------------------------------------------------------------- events
 
+# --------------------------------------------------------------------------- layout drift
+
+DRIFT_MIN_LINES = 8            # smaller pages are never classified: every change of a tiny page is "everything"
+DRIFT_MASS = 0.5               # share of the distinct lines that was replaced
+DRIFT_VOCAB = 0.35             # words (without digits) shared by old and new text, below this = new vocabulary
+DRIFT_VOCAB_NO_HEADINGS = 0.2  # pages without headings need stronger proof of a redesign
+DRIFT_HEADINGS = 0.5           # share of the old headings that must survive
+DRIFT_COLLAPSE = 0.2           # new text shorter than this share of the old one ...
+DRIFT_COLLAPSE_MIN_CHARS = 400  # ... counts only for pages that had some substance
+DRIFT_SAMPLE = 6               # changes shown in the shortened message of a redesign
+DRIFT_LABELS = {"mass": "تغییر گسترده", "redesign": "بازطراحی احتمالی", "collapse": "کوتاه شدن ناگهانی محتوا"}
+_WORD = re.compile(r"[^\W\d_]{3,}")
+
+
+@dataclass(frozen=True)
+class Drift:
+    """How much of a page changed at once, and whether it looks like a redesign instead of news.
+
+    ``mass``     half of the lines or more were replaced (fine for tables of dates, news lists, ...);
+    ``redesign`` ... and the vocabulary and the headings are new as well: the site was most likely rebuilt;
+    ``collapse`` the text shrank to a fraction (sold out, maintenance page, half-loaded page).
+    A drift never hides a change - it only labels it and, for redesign/collapse, shortens the message.
+    """
+    level: str = "normal"
+    churn: float = 0.0
+    vocab: float = 1.0
+    headings: float = 1.0
+    size: float = 1.0
+
+    def as_dict(self) -> dict:
+        return {"level": self.level, "churn": round(self.churn, 2), "vocab": round(self.vocab, 2),
+                "headings": round(self.headings, 2), "size": round(self.size, 2)}
+
+
+def _vocabulary(lines) -> set:
+    return {word.lower() for line in lines for word in _WORD.findall(line)}
+
+
+def assess_drift(old_lines, new_lines, old_headings, new_headings, old_chars: int, new_chars: int) -> Drift:
+    """Compare two snapshots of the same page (pure function, no I/O)."""
+    old_set, new_set = set(old_lines), set(new_lines)
+    if len(old_set) < DRIFT_MIN_LINES:
+        return Drift()
+    union = len(old_set | new_set)
+    churn = 1 - len(old_set & new_set) / union if union else 0.0
+    old_words, new_words = _vocabulary(old_lines), _vocabulary(new_lines)
+    vocab = len(old_words & new_words) / min(len(old_words), len(new_words)) if old_words and new_words else 0.0
+    old_heads = {h for h in old_headings if h}
+    headings = len(old_heads & {h for h in new_headings if h}) / len(old_heads) if old_heads else 1.0
+    size = new_chars / old_chars if old_chars else 1.0
+    level = "normal"
+    if old_chars >= DRIFT_COLLAPSE_MIN_CHARS and size <= DRIFT_COLLAPSE:
+        level = "collapse"
+    elif churn >= DRIFT_MASS:
+        level = "mass"
+        structure_gone = headings < DRIFT_HEADINGS if old_heads else vocab < DRIFT_VOCAB_NO_HEADINGS
+        if vocab < DRIFT_VOCAB and structure_gone:
+            level = "redesign"
+    return Drift(level, churn, vocab, headings, size)
+
+
+def _drift_lines(drift: Drift) -> list[str]:
+    if drift.level == "redesign":
+        return ["🧱 <b>احتمالاً سایت بازطراحی شده:</b> بیشتر خط‌ها و عنوان‌ها یکجا عوض شده و واژگان تقریباً کاملاً جدید است.",
+                "ℹ️ وضعیت جدید به‌عنوان مبنا ذخیره شد. اگر انتظارش را نداشتید، در کارت سایت «✏️ ویرایش ← 🎯 حالت پایش» "
+                "را بزنید تا بخش درست دوباره انتخاب شود."]
+    if drift.level == "collapse":
+        return [f"📉 <b>حجم محتوا ناگهان به ~{fa_digits(round(drift.size * 100))}٪ قبل رسید.</b> ممکن است ظرفیت تمام شده، "
+                "صفحهٔ نگهداری یا بارگذاری ناقص باشد.",
+                "ℹ️ متن جدید پایین نشان داده شده است؛ وضعیت جدید به‌عنوان مبنا ذخیره شد."]
+    return [f"🧭 <b>تغییر گسترده:</b> حدود {fa_digits(round(drift.churn * 100))}٪ از خط‌ها عوض شده؛ "
+            "اگر این صفحه فهرست یا جدول تاریخ‌هاست، طبیعی است."]
+
+
 def change_event(watch, url: str, hunks: list[Hunk], links_added: list, links_removed: list,
                  ts: float, tz: tzinfo, page_title: str = "", total_chars: int = 0,
-                 style: str = "") -> tuple[dict, str, list[str]]:
+                 style: str = "", drift: Drift | None = None) -> tuple[dict, str, list[str]]:
     """Payload, one-line summary and keyword hits for a content change."""
     style = style or getattr(watch, "report_style", "inline")
     counts = Counter(h.kind for h in hunks)
@@ -525,6 +600,10 @@ def change_event(watch, url: str, hunks: list[Hunk], links_added: list, links_re
             f"({fa_number(changed_chars)} از {fa_number(total_chars)} حرف)"
         )
 
+    compact = drift is not None and drift.level in ("redesign", "collapse")
+    if drift is not None and drift.level != "normal":
+        lines.extend(_drift_lines(drift))
+
     # --- Sprint 1.1: بخش‌های درگیر ---
     contexts = []
     for h in hunks:
@@ -552,15 +631,29 @@ def change_event(watch, url: str, hunks: list[Hunk], links_added: list, links_re
             parts = urlsplit(shown_url)
             jump_url = urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, jump_anchor))
             lines.append(f'🔗 <a href="{esc_attr(jump_url)}">پرش به بخش «{esc(truncate(jump_anchor, 40))}»</a>')
-    header = _header("🚨" if hits else "🔔", f"تغییر در «{esc(watch.label)}»", ts, tz, url=shown_url, lines=lines,
-                     rule=True)
-    blocks = _sections(hunks, full=False, show_context=not is_json, style=style, base_url=shown_url) + _link_blocks(links_added, links_removed)
+    if compact:
+        icon, title = (("🧱", f"احتمال بازطراحی سایت «{esc(watch.label)}»") if drift.level == "redesign"
+                       else ("📉", f"محتوای «{esc(watch.label)}» ناگهان کوتاه شد"))
+    else:
+        icon, title = "🚨" if hits else "🔔", f"تغییر در «{esc(watch.label)}»"
+    header = _header(icon, title, ts, tz, url=shown_url, lines=lines, rule=True)
+    if compact:
+        # a rebuilt site changes everything at once: a short sample here, the complete diff as an attachment
+        sample = [h for h in hunks if h.kind in ("add", "modify")][:DRIFT_SAMPLE] or hunks[:DRIFT_SAMPLE]
+        blocks = _sections(sample, full=False, show_context=not is_json, style=style, base_url=shown_url)
+        rest = len(hunks) - len(sample)
+        blocks.append(f"<i>… و {fa_digits(max(rest, 0))} تغییر دیگر — گزارش کامل در فایل پیوست است.</i>")
+    else:
+        blocks = (_sections(hunks, full=False, show_context=not is_json, style=style, base_url=shown_url)
+                  + _link_blocks(links_added, links_removed))
     full_blocks = _sections(hunks, full=True, show_context=not is_json, style=style, base_url=shown_url) + _link_blocks(links_added, links_removed)
     summary = "، ".join(s.split(" ", 1)[1] for s in stats)
+    if drift is not None and drift.level != "normal":
+        summary = f"{DRIFT_LABELS[drift.level]} · {summary}"
     shortened = any(len(h.old) > MSG_LINE_LIMIT or len(h.new) > MSG_LINE_LIMIT for h in hunks)
     payload = _payload(header, f"<i>ادامهٔ تغییرات «{esc(watch.label)}»</i>", blocks,
                        silent=watch.silent and not hits, doc_title=f"تغییرات {watch.label}",
-                       full_blocks=full_blocks, attach=shortened, buttons=page_button(shown_url))
+                       full_blocks=full_blocks, attach=shortened or compact, buttons=page_button(shown_url))
     return payload, summary, hits
 
 

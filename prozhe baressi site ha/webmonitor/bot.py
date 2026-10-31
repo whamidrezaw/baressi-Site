@@ -20,7 +20,6 @@ keywords, URLs) are collected through a small per-admin session.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import math
@@ -36,6 +35,7 @@ from .config import ConfigError, Proxy, Watch, check_selector
 from .engine import DIGESTABLE, ENGINE_LABELS
 from .extract import ExtractError, normalize_url, parse_feed
 from .fetchers import FetchError
+from .netguard import is_public_host  # noqa: F401 - also imported from here by older code
 from .notifier import NotifyError, TelegramApiError, build_parts
 from .registry import default_crawl
 from .util import (
@@ -213,22 +213,6 @@ def looks_like_site(text: str) -> bool:
     except ValueError:
         return False
     return parts.path not in ("", "/") or port is None
-
-
-async def is_public_host(host: str) -> bool:
-    """False for loopback / private / link-local addresses (protects the server's internal network)."""
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
-    except OSError:
-        return True  # unresolvable: the fetch itself reports a clear error
-    for info in infos:
-        try:
-            address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
-        except ValueError:
-            continue
-        if not address.is_global:
-            return False
-    return True
 
 
 def describe_result(result: str) -> str:
@@ -831,22 +815,22 @@ class AdminBot:
 
     def _miniapp_row(self, chat_id: str, site_key: int | None = None) -> list[tuple[str, str]]:
         import os
-        from .miniapp import make_admin_token
-        base = (os.environ.get("WEBMONITOR_MINIAPP_URL")
+        from .miniapp import make_admin_token, miniapp_secret
+        base = (os.environ.get("WEBMONITOR_MINIAPP_URL") or getattr(self.m.config, "miniapp_url", "")
                 or self.m.store.get_setting("miniapp_url", "https://deutschelager.duckdns.org")).strip().rstrip("/")
         if not base or base == "off":
             return []
-        tok = make_admin_token(self.m.config.telegram.token, "admin")
-        qs = [f"t={tok}"] if tok else []
-        if site_key is not None:
-            qs.append(f"site={site_key}")
-        url = f"{base}/app" + ("?" + "&".join(qs) if qs else "")
+        if str(chat_id).startswith("-"):
+            return []  # an admin link must never be posted into a group or channel
+        url = f"{base}/app" + (f"?site={site_key}" if site_key is not None else "")
         label = "🚀 پروفایل گرافیکی این سایت (مینی‌اپ)" if site_key is not None else "🚀 باز کردن مینی‌اپ (داشبورد گرافیکی)"
-        is_private = not str(chat_id).startswith("-")
-        if is_private and url.startswith("https://"):
-            return [(label, f"webapp:{url}")]
-        if url.startswith(("http://", "https://")):
-            return [(label, url)]
+        if url.startswith("https://"):
+            return [(label, f"webapp:{url}")]  # Telegram signs the launch data itself (initData): no token needed
+        if url.startswith("http://"):
+            # outside a Web App button there is no initData: carry a signed token bound to this admin, in the
+            # URL fragment (it is never sent to the server, so it stays out of access logs and Referer headers)
+            token = make_admin_token(miniapp_secret(self.m.store), str(chat_id))
+            return [(label, f"{url}#t={token}")]
         return []
 
     async def show_menu(self, chat_id: str, edit: int | None = None, note: str = "") -> None:

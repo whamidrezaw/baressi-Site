@@ -86,6 +86,7 @@ class ChallengeManager:
         self._public_base: str | None = None  # set by engine when known
         self._pending_watchers: dict[str, asyncio.Future] = {}
         self._route_installers: list[Callable[[web.Application], None]] = []
+        self.health_provider: Callable[[], dict] | None = None  # set by the engine (see health.py)
 
     def add_routes(self, installer: Callable[[web.Application], None]) -> None:
         self._route_installers.append(installer)
@@ -211,7 +212,18 @@ class ChallengeManager:
     # ------------------------------------------------------------------ HTTP handlers
 
     async def _handle_health(self, _request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "sessions": self.count(), "host": self.host, "port": self.port})
+        data = {"ok": True, "sessions": self.count(), "host": self.host, "port": self.port}
+        status = 200
+        if self.health_provider is not None:
+            try:
+                report = self.health_provider()
+            except Exception as exc:  # the probe itself must never take the server down
+                log.exception("health report failed")
+                report = {"status": "down", "problems": [f"health report failed: {type(exc).__name__}"]}
+            data.update(report)
+            data["ok"] = report.get("status") != "down"
+            status = 503 if report.get("status") == "down" else 200
+        return web.json_response(data, status=status)
 
     async def _handle_page(self, request: web.Request) -> web.Response:
         token = request.match_info["token"]

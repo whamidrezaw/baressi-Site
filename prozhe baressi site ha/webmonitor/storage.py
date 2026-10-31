@@ -9,6 +9,7 @@ lose it.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections import Counter
@@ -437,6 +438,61 @@ class Store:
         with self.conn:
             self.conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
                               "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+    # ------------------------------------------------------------------ health & backup
+
+    def quick_check(self) -> str:
+        """``"ok"`` or the first problem SQLite reports (a fast structural check, run once at start-up)."""
+        try:
+            row = self.conn.execute("PRAGMA quick_check(1)").fetchone()
+            return str(row[0]) if row else "no result"
+        except sqlite3.Error as exc:
+            return f"{type(exc).__name__}: {exc}"
+
+    def overdue_outbox_age(self, now: float | None = None) -> float:
+        """Seconds the oldest *due* notification has been waiting (0 when nothing is overdue).
+
+        Events that wait on purpose (retry back-off, cooldown digests) are not due yet and do not count; a
+        number that keeps growing means alerts are being created but cannot be delivered."""
+        now = time.time() if now is None else now
+        row = self.conn.execute("SELECT MIN(created) FROM events WHERE status = 'pending' AND next_attempt <= ?",
+                                (now,)).fetchone()
+        return max(0.0, now - row[0]) if row and row[0] is not None else 0.0
+
+    def backup(self, directory: Path, keep: int = 7) -> Path | None:
+        """Write a consistent copy of the database into ``directory`` and drop all but the newest ``keep``.
+
+        Sites added from the Telegram panel exist only in this database, so a copy is the only way back after
+        a damaged disk or file. It uses its own connection (``VACUUM INTO``), which makes it safe to call from a
+        worker thread while the monitor keeps writing. A copy that fails its own integrity check is deleted
+        and ``None`` is returned."""
+        directory.mkdir(parents=True, exist_ok=True)
+        # UTC stamp + microseconds: names sort in the order the copies were made (also across a DST change)
+        moment = time.time()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(moment))
+        target = directory / f"monitor-{stamp}-{int(moment % 1 * 1_000_000):06d}.db"
+        source = sqlite3.connect(str(self.path), timeout=30)
+        try:
+            source.execute("VACUUM INTO ?", (str(target),))
+        finally:
+            source.close()
+        copy = sqlite3.connect(str(target))
+        try:
+            verdict = copy.execute("PRAGMA quick_check(1)").fetchone()
+        finally:
+            copy.close()
+        if not verdict or verdict[0] != "ok":
+            target.unlink(missing_ok=True)
+            return None
+        try:
+            os.chmod(target, 0o600)  # the copy holds the admin list and every watch definition
+        except OSError:
+            pass
+        if keep > 0:  # the new copy plus the newest keep-1 older ones stay
+            older = sorted(p for p in directory.glob("monitor-*.db") if p != target)
+            for old in older[:max(0, len(older) - (keep - 1))]:
+                old.unlink(missing_ok=True)
+        return target
 
     # ------------------------------------------------------------------ maintenance
 

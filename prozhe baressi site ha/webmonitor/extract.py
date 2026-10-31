@@ -12,6 +12,7 @@ import copy
 import json
 import math
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -94,6 +95,66 @@ class ExtractError(Exception):
     def __init__(self, message: str, kind: str = "content"):
         super().__init__(message)
         self.kind = kind  # selector | short | type | parse | empty
+        self.suggestion = ""  # a selector that now holds the old content (set when the selector stopped matching)
+        self.cover = 0.0
+
+
+SUGGEST_MIN_COVER = 0.6  # share of the old lines that the suggested element must contain again
+SUGGEST_BUDGET = 3.0     # seconds the search may take (it runs in a worker thread)
+_SIMPLE_NAME = re.compile(r"[A-Za-z][\w-]*$")
+
+
+def _css_for(el) -> str | None:
+    ident = el.get("id") or ""
+    if _SIMPLE_NAME.match(ident):
+        return "#" + ident
+    classes = [c for c in (el.get("class") or "").split() if _SIMPLE_NAME.match(c)]
+    return f"{el.tag}." + ".".join(classes[:2]) if classes else None
+
+
+def suggest_selector(doc, base_url: str, old_lines, *, exclude_selectors=(), ignore_patterns=(),
+                     track_links: bool = False):
+    """After a selector stopped matching: which element of the NEW page holds the text it used to capture?
+
+    Returns ``(css selector, share of the old lines found again)`` or ``None`` when nothing comes close - the
+    content may really be gone, and a wrong suggestion would be worse than none."""
+    old = {line for line in old_lines if line}
+    probes = list(dict.fromkeys(" ".join(line.replace(" | ", " ").split())[:60] for line in old if len(line) > 12))
+    if len(probes) < 3:
+        return None
+    probes = probes[::max(1, len(probes) // 200)]
+    deadline = time.monotonic() + SUGGEST_BUDGET
+    ranked = []
+    for el in doc.iter("main", "article", "section", "div", "table", "ul", "ol", "form"):
+        if time.monotonic() > deadline:
+            break
+        css = _css_for(el)
+        if not css:
+            continue
+        text = " ".join(" ".join(el.itertext()).split())
+        share = sum(1 for probe in probes if probe in text) / len(probes)
+        if share >= SUGGEST_MIN_COVER:
+            ranked.append((share, -len(text), css))
+    ranked.sort(reverse=True)
+    best = None
+    tried = set()
+    for _share, _size, css in ranked:
+        if css in tried:
+            continue
+        tried.add(css)
+        if len(tried) > 6 or time.monotonic() > deadline:
+            break
+        try:
+            snap = page_snapshot(doc, base_url, selector=css, exclude_selectors=exclude_selectors,
+                                 ignore_patterns=ignore_patterns, track_links=track_links)
+        except ExtractError:
+            continue
+        found = old & set(snap.lines)
+        cover = len(found) / len(old)
+        score = cover * 0.7 + (len(found) / max(len(snap.lines), 1)) * 0.3
+        if cover >= SUGGEST_MIN_COVER and (best is None or score > best[0]):
+            best = (score, css, cover)
+    return (best[1], best[2]) if best else None
 
 
 @dataclass
